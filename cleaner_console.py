@@ -10,7 +10,6 @@ import sys
 class Console:
     p_type = {'-p': 'posting', '-c': 'comment'}
     ACCOUNTS_FILE = 'dcinside-cleaner-accounts.json'
-    COOKIE_FILE = 'dcinside-cleaner-login.json'
 
     def __init__(self):
         self.cleaner = Cleaner()
@@ -19,28 +18,9 @@ class Console:
         self.user_id = ''
         self.user_pw = ''
         
-        # Check for cookie file and perform automatic login
-        if os.path.exists(self.COOKIE_FILE):
-            try:
-                with open(self.COOKIE_FILE, 'r', encoding='utf-8') as f:
-                    cookie_data = json.load(f)
-                    if 'cookies' in cookie_data:
-                        print("저장된 쿠키 정보를 사용하여 로그인을 시도합니다...")
-                        if self.cleaner.loginFromCookies(cookie_data['cookies']):
-                            self.user_id = self.cleaner.getUserId()
-                            if self.cleaner.verifyLogin():
-                                self.login_flag = True
-                                print(f"쿠키 로그인에 성공했습니다! (ID: {self.user_id})")
-                            else:
-                                self.cleaner.session.cookies.clear()
-                                print("쿠키가 만료되었습니다. 다시 로그인해주세요.")
-            except Exception as e:
-                print(f"쿠키 파일 로드 중 오류 발생: {e}")
-                
         if not self.login_flag:
             self.show_account_list()
-            print('\n※ "cookie" 명령어로 브라우저 쿠키를 입력하여 로그인하는 것을 권장합니다.')
-            print('  (ID/PW 로그인은 디시인사이드 보안 정책으로 차단될 수 있습니다.)\n')
+            print('\n* "cookie" 명령어 로그인을 권장합니다. (ID/PW 방식은 차단될 수 있습니다)\n')
             
         self.getCommand()
 
@@ -50,34 +30,45 @@ class Console:
                 accounts = json.load(f)
                 if accounts:
                     print('\n[저장된 계정 목록]')
-                    for slot in sorted(accounts.keys()):
+                    for slot in sorted(accounts.keys(), key=lambda x: int(x) if x.isdigit() else x):
                         print(f'{slot}: {accounts[slot]["user_id"]}')
-                    print('번호(1, 2...)를 입력하여 즉시 로그인할 수 있습니다.\n')
+                    
+                    if getattr(self, 'login_flag', False):
+                        print('* 현재 로그인된 상태라면 "login 번호"로 계정을 전환해 주세요. (예: login 1)\n')
+                    else:
+                        print('* 저장된 번호를 입력하여 즉시 로그인해 주세요.\n')
     
-    def save_account(self, slot):
+    def save_account(self, slot=None):
         accounts = {}
         if os.path.exists(self.ACCOUNTS_FILE):
-            with open(self.ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
-                accounts = json.load(f)
+            try:
+                with open(self.ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+                    accounts = json.load(f)
+            except Exception: pass
+            
+        current_user_id = self.cleaner.getUserId()
+            
+        if slot is None:
+            # 중복 ID 검사: 이미 저장된 아이디라면 해당 번호(슬롯)를 찾아 덮어씁니다.
+            for k, v in accounts.items():
+                if v.get('user_id') == current_user_id:
+                    slot = str(k)
+                    break
+                    
+            if slot is None:
+                existing_slots = [int(k) for k in accounts.keys() if k.isdigit()]
+                slot = str(max(existing_slots) + 1 if existing_slots else 1)
+        else:
+            slot = str(slot)
+            
         accounts[slot] = {
             'user_id': self.cleaner.getUserId(),
-            'user_pw': self.user_pw
+            'user_pw': self.user_pw,
+            'cookies': self.cleaner.getCookies()
         }
         with open(self.ACCOUNTS_FILE, 'wt', encoding='utf-8') as f:
             f.write(json.dumps(accounts, indent=4))
-        print(f'{slot}번에 계정이 저장되었습니다.')
-    
-    def save_cookies(self):
-        """현재 세션 쿠키를 파일에 저장합니다."""
-        try:
-            data = {
-                'cookies': self.cleaner.getCookies(),
-                'user_id': self.cleaner.getUserId()
-            }
-            with open(self.COOKIE_FILE, 'wt', encoding='utf-8') as f:
-                f.write(json.dumps(data))
-        except Exception:
-            pass
+        print(f'[{slot}번 계정] 저장되었습니다.')
         
     def load_and_login(self, slot):
         if not os.path.exists(self.ACCOUNTS_FILE):
@@ -85,34 +76,61 @@ class Console:
             return False
         with open(self.ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
             accounts = json.load(f)
-            if slot not in accounts:
-                print(f'{slot}번 계정 정보가 없습니다.')
-                return False
-            data = accounts[slot]
-            print(f'{slot}번 계정({data["user_id"]})으로 로그인을 시도합니다...')
-            res = self.cleaner.login(data['user_id'], data['user_pw'])
-            if res:
-                self.user_pw = data['user_pw']
-                self.save_account(slot)
-                print('ID/PW를 사용하여 로그인되었습니다.')
-                return True
-            print('로그인에 실패하였습니다. 비밀번호가 변경되었는지 확인해주세요.')
+            
+        if slot not in accounts:
+            print(f'{slot}번 계정 정보가 없습니다.')
             return False
+            
+        data = accounts[slot]
+        print(f'[{slot}번: {data["user_id"]}] 로그인을 시도합니다...')
+        
+        self.cleaner.setUserId(data['user_id'])
+        
+        if 'cookies' in data:
+            print('쿠키로 로그인을 시도합니다...')
+            if self.cleaner.loginFromCookies(data['cookies']):
+                if self.cleaner.verifyLogin():
+                    self.user_pw = data.get('user_pw', '')
+                    self.user_id = data['user_id']
+                    print('쿠키 로그인에 성공했습니다.')
+                    return True
+                else:
+                    self.cleaner.session.cookies.clear()
+                    print('쿠키가 만료되어 ID/PW로 재로그인을 시도합니다...')
+            else:
+                print('쿠키 로그인에 실패하여 ID/PW로 로그인을 시도합니다...')
+                
+        if not data.get('user_pw'):
+            print('비밀번호가 없어 수동 로그인이 필요합니다.')
+            return False
+            
+        res = self.cleaner.login(data['user_id'], data['user_pw'])
+        if res:
+            self.user_pw = data['user_pw']
+            self.user_id = data['user_id']
+            self.save_account(slot)
+            print('ID/PW로 로그인되었습니다.')
+            return True
+            
+        print('로그인에 실패했습니다. 비밀번호를 확인해 주세요.')
+        return False
 
     def parseAndExecute(self, cmd_input : str) -> int:
         cmd = cmd_input.split()
         if not cmd: return 0
 
         if cmd[0] == 'help':
-            print('1, 2, ... - 저장된 번호로 즉시 로그인합니다.')
-            print('login - 수동으로 로그인합니다. (비밀번호 변경 캠페인, JS 로그인 시 실패 가능)')
-            print('cookie - 브라우저 쿠키를 직접 입력하여 로그인합니다. (강력 권장)')
-            print('export [번호] - 현재 로그인 정보를 해당 번호에 저장합니다. (예: export 1)')
+            print('1, 2... - 지정한 번호로 로그인합니다.')
+            print('login - 수동으로 로그인합니다.')
+            print('cookie - 쿠키를 직접 입력하여 로그인합니다.')
+            print('export [번호] - 로그인 정보를 특정 번호에 수동으로 저장합니다.')
+            print('remove [번호] - 저장된 계정을 삭제합니다. (예: remove 1)')
+            print('list - 저장된 계정 목록을 확인합니다.')
             print('p - 작성한 글 리스트를 가져옵니다.')
             print('c - 작성한 댓글 리스트를 가져옵니다.')
-            print('getglist -p, -c로도 사용 가능')
-            print('del all | 1 2 3 4 ... | 1 ~ 4 - 선택한 갤러리에 대해 삭제를 수행합니다.')
-            print('proxy load [파일명] - 프록시 리스트(txt)를 불러옵니다.')
+            print('getglist -p, -c로도 사용 가능합니다.')
+            print('del all | 1 2 3... | 1 ~ 4 - 선택한 갤러리의 글/댓글을 삭제합니다.')
+            print('proxy load [파일명] - 프록시 리스트를 불러옵니다.')
             print('proxy off - 프록시 사용을 중지합니다.')
             print('2captcha [api_key] - 2captcha API 키를 설정합니다.')
             print('logout - 로그아웃합니다.')
@@ -191,32 +209,44 @@ class Console:
             return 0
 
         elif cmd[0] == 'login':
-            if self.login_flag:
-                print('이미 로그인되었습니다.')
+            if len(cmd) > 1 and cmd[1].isdigit():
+                self.login_flag = False
+                if self.load_and_login(cmd[1]):
+                    self.login_flag = True
                 return 0
+
+            if self.login_flag:
+                print('기존 세션을 종료하고 새 로그인을 진행합니다.')
+                self.login_flag = False
+                self.cleaner.session.cookies.clear()
             
             self.user_id = input('ID >> ')
             self.user_pw = getpass('PW >> ')
             res = self.cleaner.login(self.user_id, self.user_pw)
             if res:
-                print('로그인되었습니다! (캡차 자동 풀기 포함)')
-                print('※ 갤로그에서 글 목록이 안 보이면 "cookie" 명령어로 재시도하세요.')
+                print('로그인 성공! (캡차 자동 처리)')
+                print('* 글 목록이 안 보이면 "cookie" 명령어를 사용해 주세요.')
                 self.login_flag = True
-                self.save_cookies()
+                self.save_account()
             else:
-                print('로그인에 실패하였습니다.')
-                print('원인: 캡차 인식 실패 / 보안 정책 차단 / ID·PW 오류')
-                print('대신 "cookie" 명령어를 사용하여 브라우저 쿠키로 로그인해보세요.')
+                print('로그인에 실패했습니다.')
+                print('원인: 캡차 실패, 계정 정보 오류, 또는 차단됨')
+                print('* "cookie" 명령어 사용을 권장합니다.')
                 return 0
 
         elif cmd[0] == 'cookie':
             if self.login_flag:
-                print('이미 로그인되었습니다.')
-                return 0
+                print('기존 세션을 종료하고 새 쿠키 로그인을 진행합니다.')
+                self.login_flag = False
+                self.cleaner.session.cookies.clear()
             
-            self.user_id = input('갤로그 ID (비워두면 쿠키에서 자동 추출 시도) >> ').strip()
-            print('브라우저 F12 -> Network -> 아무 요청 클릭 -> Request Headers 내의 Cookie 문자열을 붙여넣으세요.')
+            self.user_id = input('갤로그 ID (비워두면 자동 추출) >> ').strip()
+            print('F12 -> Network -> Cookie 문자열을 붙여넣어 주세요.')
             raw_cookie = input('Cookie >> ')
+            
+            if not raw_cookie.strip():
+                print('쿠키가 입력되지 않았습니다.')
+                return 0
             
             import http.cookies
             parsed_cookies = {}
@@ -225,8 +255,12 @@ class Console:
                 simple_cookie.load(raw_cookie)
                 for key, morsel in simple_cookie.items():
                     parsed_cookies[key] = morsel.value
+                
+                if not parsed_cookies:
+                    print('잘못된 쿠키 형식입니다.')
+                    return 0
             except Exception as e:
-                print(f'쿠키 파싱 실패: {e}')
+                print(f'쿠키를 처리하지 못했습니다: {e}')
                 return 0
                 
             res = self.cleaner.loginFromCookies(parsed_cookies)
@@ -238,21 +272,44 @@ class Console:
             if res or self.cleaner.verifyLogin():
                 print(f'쿠키 로그인 성공! (ID: {self.user_id})')
                 self.login_flag = True
-                self.save_cookies()
-                print('쿠키가 자동 저장되었습니다. 다음 실행 시 자동 로그인됩니다.')
+                self.save_account()
+                print('쿠키가 저장되어 이후 번호로 로그인할 수 있습니다.')
             else:
-                print('쿠키 로그인 상태가 유효하지 않습니다. (올바른 쿠키인지 확인하세요)')
+                print('유효하지 않은 쿠키입니다.')
                 return 0
+
+        elif cmd[0] == 'remove':
+            if len(cmd) < 2:
+                print('삭제할 번호를 입력해 주세요. (예: remove 1)')
+                return 0
+            slot = cmd[1]
+            if os.path.exists(self.ACCOUNTS_FILE):
+                with open(self.ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+                    accounts = json.load(f)
+                if slot in accounts:
+                    del accounts[slot]
+                    with open(self.ACCOUNTS_FILE, 'wt', encoding='utf-8') as f:
+                        f.write(json.dumps(accounts, indent=4))
+                    print(f'[{slot}번 계정] 삭제되었습니다.')
+                else:
+                    print(f'[{slot}번 계정] 존재하지 않습니다.')
+            else:
+                print('저장된 계정 파일이 없습니다.')
+            return 0
 
         elif cmd[0] == 'export':
             if not self.login_flag:
-                print('로그인해 주십시오.')
+                print('먼저 로그인해 주세요.')
                 return 0
             slot = cmd[1] if len(cmd) > 1 else '1'
             self.save_account(slot)
 
+        elif cmd[0] == 'list':
+            self.show_account_list()
+            return 0
+
         elif not self.login_flag: 
-            print('로그인해 주십시오. (또는 저장된 번호 입력)')
+            print('먼저 로그인해 주세요. (번호 또는 login 입력)')
             return 0
 
         elif cmd[0] in ['p', 'c', 'getglist']:
@@ -262,7 +319,7 @@ class Console:
                 post_type = 'comment'
             else:
                 if len(cmd) < 2 or cmd[1] not in self.p_type:
-                    print('옵션을 입력하십시오. (p: 글, c: 댓글)')
+                    print('옵션을 입력해 주세요. (p: 글, c: 댓글)')
                     return 0
                 post_type = self.p_type[cmd[1]]
 
@@ -284,11 +341,11 @@ class Console:
 
         elif cmd[0] == 'del':
             if self.g_list.get('type') == None:
-                print('갤러리 리스트를 선택하지 않았습니다.')
+                print('갤러리 리스트를 선택해 주세요.')
                 return 0
             del_list = []
             if len(cmd) < 2:
-                print('삭제할 번호를 입력하십시오.')
+                print('삭제할 번호를 입력해 주세요.')
                 return 0
             if cmd[1] == 'all':
                 del_list = [str(k) for k in self.g_list.keys() if isinstance(k, int)]
@@ -311,6 +368,7 @@ class Console:
             self.user_id = ''
             self.user_pw = ''
             print('로그아웃되었습니다.')
+            self.show_account_list()
 
     def delete(self, gno, post_type):
         print('글 목록 가져오는 중... (취소: Ctrl+C)')
@@ -329,7 +387,7 @@ class Console:
             print('\n작업이 취소되었습니다.')
             return
 
-        print('글 지우는 중... (일시정지: Ctrl+C)')
+        print('삭제 중... (일시정지: Ctrl+C)')
         try:
             with tqdm(total=len(self.cleaner.post_list)) as pbar:
                 generator = self.cleaner.deletePosts(post_type)
@@ -340,29 +398,32 @@ class Console:
                             print('IP 차단이 감지되었습니다.')
                             return
                         if i == 'captcha':
-                            print('reCAPTCHA Detected!')
-                            input('캡차를 해제한 후 엔터키를 눌러주십시오.')
+                            print('reCAPTCHA가 감지되었습니다!')
+                            input('캡차 해제 후 엔터를 눌러주세요 >> ')
                         pbar.update(1)
                     except StopIteration:
                         break
                     except KeyboardInterrupt:
-                        print('\n[일시정지] 계속 진행하시겠습니까? (y/n)')
+                        print('\n[일시정지] 계속할까요? (y/n)')
                         ans = input('>> ').strip().lower()
                         if ans != 'y':
                             print('삭제가 취소되었습니다.')
                             return
-                        print('이어서 삭제를 진행합니다...')
+                        print('삭제를 재개합니다...')
         except KeyboardInterrupt:
             print('\n삭제가 취소되었습니다.')
             return
-        print('\n삭제 완료.')
+        print('\n삭제가 완료되었습니다.')
 
     def getCommand(self):
         print('dcinside cleaner')
-        print('사용법은 help를 입력하세요.')
+        print('사용법이 필요하면 help를 입력해 주세요.')
         while True:
             try:
-                cmd = input('>> ')
+                prompt_text = f'[{self.user_id}] >> ' if self.login_flag and self.user_id else '>> '
+                cmd = input(prompt_text).strip()
+                if not cmd:
+                    continue
                 if cmd == 'exit':
                     break
                 self.parseAndExecute(cmd)
@@ -370,4 +431,4 @@ class Console:
                 break
             except Exception:
                 traceback.print_exc()
-                print('문제가 발생하였습니다.')
+                print('오류가 발생했습니다.')

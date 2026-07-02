@@ -56,6 +56,7 @@ class Cleaner:
         self.twocaptcha_key = ''
         self.solver : TwoCaptcha
         self.delay = MAX_DELAY
+        self.user_id = ''
 
     def updateDelay(self):
         self.delay = round(MAX_DELAY / (len(self.proxy_list) or 1), 1)
@@ -109,11 +110,8 @@ class Cleaner:
 
     def _propagateCookies(self, cookies: dict) -> None:
         """쿠키를 모든 관련 도메인에 전파합니다."""
-        domains = ['.dcinside.com', '.gallog.dcinside.com', 'gallog.dcinside.com',
-                   'sign.dcinside.com', '.sign.dcinside.com']
         for k, v in cookies.items():
-            for domain in domains:
-                self.session.cookies.set(k, v, domain=domain)
+            self.session.cookies.set(k, v, domain='.dcinside.com')
 
     def loginFromCookies(self, cookies: dict) -> bool:
         self._propagateCookies(cookies)
