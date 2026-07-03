@@ -410,6 +410,7 @@ class Console:
                             print('삭제가 취소되었습니다.')
                             return
                         print('삭제를 재개합니다...')
+                        generator = self.cleaner.deletePosts(post_type)
         except KeyboardInterrupt:
             print('\n삭제가 취소되었습니다.')
             return
