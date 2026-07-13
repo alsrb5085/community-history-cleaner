@@ -20,7 +20,7 @@ class Console:
         
         if not self.login_flag:
             self.show_account_list()
-            print('\n* "cookie" 명령어 로그인을 권장합니다. (ID/PW 방식은 차단될 수 있습니다)\n')
+            print('* ID/PW로 로그인이 안될 땐 "cookie" 명령어를 사용해 주세요.\n')
             
         self.getCommand()
 
@@ -34,9 +34,9 @@ class Console:
                         print(f'{slot}: {accounts[slot]["user_id"]}')
                     
                     if getattr(self, 'login_flag', False):
-                        print('* 현재 로그인된 상태라면 "login 번호"로 계정을 전환해 주세요. (예: login 1)\n')
+                        print('* 현재 로그인된 상태라면 "login 번호"로 계정을 전환해 주세요. (예: login 1)')
                     else:
-                        print('* 저장된 번호를 입력하여 즉시 로그인해 주세요.\n')
+                        print('* 저장된 번호를 입력하여 바로 로그인할 수 있습니다.')
     
     def save_account(self, slot=None):
         accounts = {}
@@ -231,7 +231,7 @@ class Console:
             else:
                 print('로그인에 실패했습니다.')
                 print('원인: 캡차 실패, 계정 정보 오류, 또는 차단됨')
-                print('* "cookie" 명령어 사용을 권장합니다.')
+                print('* ID/PW로 로그인이 안될 땐 "cookie" 명령어를 사용해 주세요.')
                 return 0
 
         elif cmd[0] == 'cookie':
@@ -313,6 +313,22 @@ class Console:
             return 0
 
         elif cmd[0] in ['p', 'c', 'getglist']:
+            if not self.cleaner.verifyLogin():
+                print('\n로그인 세션이 만료되었습니다.')
+                if self.user_id and self.user_pw:
+                    print('저장된 정보로 재로그인을 시도합니다...')
+                    if self.cleaner.login(self.user_id, self.user_pw):
+                        print('재로그인 성공!')
+                        self.save_account()
+                    else:
+                        print('재로그인에 실패했습니다. 수동으로 다시 로그인해 주세요.')
+                        self.login_flag = False
+                        return 0
+                else:
+                    print('다시 로그인해 주세요.')
+                    self.login_flag = False
+                    return 0
+
             if cmd[0] == 'p': 
                 post_type = 'posting'
             elif cmd[0] == 'c': 
@@ -371,11 +387,30 @@ class Console:
             self.show_account_list()
 
     def delete(self, gno, post_type):
+        if not self.cleaner.verifyLogin():
+            print('\n로그인 세션이 만료되었습니다.')
+            if self.user_id and self.user_pw:
+                print('저장된 정보로 재로그인을 시도합니다...')
+                if self.cleaner.login(self.user_id, self.user_pw):
+                    print('재로그인 성공!')
+                    self.save_account()
+                else:
+                    print('재로그인에 실패했습니다. 수동으로 다시 로그인해 주세요.')
+                    self.login_flag = False
+                    return
+            else:
+                print('다시 로그인해 주세요.')
+                self.login_flag = False
+                return
+
         print('글 목록 가져오는 중... (취소: Ctrl+C)')
         try:
             page_count = self.cleaner.getPageCount(gno, post_type)
             if page_count == 'ipblocked':
                 print('IP 차단이 감지되었습니다.')
+                return
+            if page_count == 0:
+                print('삭제할 항목이 없습니다.')
                 return
             with tqdm(total=page_count) as pbar:
                 for i in self.cleaner.aggregatePosts(gno, post_type):
