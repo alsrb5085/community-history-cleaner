@@ -27,11 +27,18 @@ ENV/
 # Personal Data / Logs
 dcinside-cleaner-login.json
 dcinside-cleaner-accounts.json
+dcinside-app-device.json
 *.log
 wget-log*
 badblocks.txt
 /tmp/captcha_*.jpg
 *.html
+
+# 일회용 진단 스크립트
+diag_*.py
+test_nyaa.py
+
+.config/
 
 # OS Files
 .DS_Store
