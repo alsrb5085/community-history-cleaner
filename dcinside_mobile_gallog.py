@@ -89,6 +89,9 @@ class MobileGallog:
                 res = self.session.post(f'{BASE}{path}', data=data, timeout=TIMEOUT)
             except requests.RequestException:
                 return None
+            # 429는 토큰을 새로 받아도 같은 답이 온다. 재시도하면 요청만 는다
+            if res.status_code == 429:
+                return None
             if res.text.strip():
                 try:
                     return res.json()
@@ -167,6 +170,15 @@ class MobileGallog:
         form = {'no': log_no, 'g_id': user_id, 'con_key': block_key}
         form.update(self.extra_auth)
         res = self.session.post(f'{BASE}/gallog/log-del', data=form, timeout=TIMEOUT)
+
+        # 상태 코드를 먼저 본다. 429는 {"message":"Too Many Attempts."}라는
+        # JSON을 돌려주는데, result 키가 없어 아래 성공 판정을 그냥 통과한다
+        # 그러면 지워지지도 않은 항목이 성공으로 집계되어 목록에서 빠진다
+        if res.status_code == 429:
+            return {'ok': False, 'cause': 'THROTTLED', 'transient': True}
+        if res.status_code != 200:
+            return {'ok': False, 'cause': f'HTTP {res.status_code}', 'transient': True}
+
         if not res.text.strip():
             return {'ok': False, 'cause': 'BLOCKED', 'transient': True}
         try:
@@ -174,8 +186,10 @@ class MobileGallog:
         except ValueError:
             return {'ok': False, 'cause': 'BLOCKED', 'transient': True}
 
-        if not isinstance(payload, dict):
-            return {'ok': True, 'cause': '', 'transient': False}
+        # 갤로그가 돌려주는 형태가 아니다. 성공으로 읽을 근거가 없다
+        if not isinstance(payload, dict) or 'result' not in payload:
+            return {'ok': False, 'cause': f'알 수 없는 응답: {str(payload)[:100]}',
+                    'transient': True}
 
         # 갤로그 JS의 판정은 `0 == result면 실패` 하나뿐이다. 성공 값을 좁게
         # 잡으면 실제로 지워진 글이 실패로 집계됨
@@ -183,7 +197,24 @@ class MobileGallog:
             return {'ok': True, 'cause': '', 'transient': False}
 
         cause = str(payload.get('cause') or '삭제에 실패했습니다.')
+        # 이 문구는 기다린다고 풀리지 않는다. 봇 확인이 걸린 것이라
+        # 갤로그에서 캡차를 풀어야 다시 지울 수 있다 (180초·360초 대기 실패 확인)
+        if _isBotGate(cause):
+            return {'ok': False, 'cause': cause, 'transient': False, 'captcha': True}
         return {'ok': False, 'cause': cause, 'transient': _isTransient(cause)}
+
+    def hasCaptcha(self, user_id: str) -> Optional[bool]:
+        """갤로그 페이지에 봇 확인 레이어가 붙었는지. 확인 자체가 실패하면 None
+
+        갤로그 JS도 삭제 버튼을 누르기 전에 이 요소부터 본다
+        """
+        try:
+            res = self.session.get(f'{BASE}/gallog/{user_id}?menu=R_all', timeout=TIMEOUT)
+        except requests.RequestException:
+            return None
+        if res.status_code != 200 or not res.text.strip():
+            return None
+        return 'captcha_div' in res.text
 
 
 def _isFailureResult(result) -> bool:
@@ -211,6 +242,14 @@ def _isFailureResult(result) -> bool:
 def _isTransient(cause: str) -> bool:
     squeezed = cause.replace(' ', '')
     return '잠시후다시' in squeezed or '다시시도' in squeezed
+
+
+def _isBotGate(cause: str) -> bool:
+    """캡차를 풀어야만 풀리는 거절인지
+
+    문구는 일시적인 것처럼 보이지만 기다려서는 풀리지 않는다
+    """
+    return '잠시후다시이용' in cause.replace(' ', '')
 
 
 def _toInt(value, default: int = 0) -> int:

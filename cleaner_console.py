@@ -531,7 +531,9 @@ class Console:
                                 tqdm.write('응답이 정상으로 돌아왔습니다.')
                                 continue
                             if i['data'] == 'captcha':
-                                print('reCAPTCHA가 감지되었습니다!')
+                                print('캡차가 감지되었습니다!')
+                                if i.get('where'):
+                                    print(f"  {i['where']} 에서 삭제를 눌러 코드를 입력해 주세요.")
                                 input('캡차 해제 후 엔터를 눌러주세요 >> ')
                                 continue
                             if i['data'] == 'requeued':

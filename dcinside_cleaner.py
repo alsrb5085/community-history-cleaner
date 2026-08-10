@@ -390,17 +390,27 @@ class Cleaner:
         if not solve_captcha and self.isAppApiReady() and self._canUseAppApi(entry, post_type):
             result = self._deleteViaAppApi(entry, post_type)
 
-            # 막힌 거라면 갤로그로 넘기지 않는다. 피하려던 부하가 그대로 돌아온다
-            if not result or result == 'BLOCKED':
+            # 삭제 성공
+            if isinstance(result, dict) and not result:
                 return result
 
-            # 앱 API가 이 항목을 거부했다
-            # 원글이 삭제된 댓글이 대표적이다. 앱 API는 원글 번호로 대상을 찾는다
-            # 갤로그 log-del은 로그 항목을 지우므로 원글이 없어도 된다
+            # 막힌 거라면 갤로그로 넘기지 않는다. 피하려던 부하가 그대로 돌아온다
+            if result == 'BLOCKED':
+                return result
+
+            # result가 None이면 앱 API를 쓸 수 없다는 뜻이다
+            # 성공(빈 dict)과 헷갈려 그대로 돌려주면 지우지도 않은 항목이
+            # 성공으로 집계되고 목록에서 빠진다. 반드시 갤로그로 넘겨야 한다
+            #
+            # 거부당한 경우도 마찬가지로 넘긴다. 원글이 삭제된 댓글이 대표적이다
+            # 앱 API는 원글 번호로 대상을 찾지만 갤로그 log-del은 로그 항목을
+            # 지우므로 원글이 없어도 된다
             if self.use_mobile and entry.get('log_no'):
                 fallback = self._deleteViaMobileGallog(entry['log_no'])
                 if fallback is not None:
                     return fallback
+            if result is None:
+                return {'result': 'fail', 'msg': self.last_app_api_error or '앱 API를 쓸 수 없습니다.'}
             return result
 
         # 2) 모바일 갤로그. log_no 하나로 글·댓글을 모두 처리한다
@@ -489,29 +499,31 @@ class Cleaner:
     def _deleteViaMobileGallog(self, log_no: str):
         """모바일 갤로그로 글/댓글을 삭제한다
 
-        실패하면 토큰을 갱신해 한 번 더 해 보고, 그래도 안 되면 None
+        돌려주는 값
+          {}          삭제 성공
+          'BLOCKED'   429나 빈 응답. 기다렸다 다시 하면 풀린다
+          'CAPTCHA'   봇 확인. 기다려도 안 풀리고 캡차를 풀어야 한다
+          {...}       이 항목만의 실패
+          None        경로를 쓸 수 없음
         """
-        try:
-            result = self.mobile.delete(self.user_id, log_no)
-        except Exception:
-            return None
+        result = None
+        for attempt in range(2):
+            try:
+                result = self.mobile.delete(self.user_id, log_no)
+            except Exception:
+                return None
 
-        if result['ok']:
-            return {}
-        if result['cause'] == 'BLOCKED' or result.get('transient'):
-            return 'BLOCKED'
+            if result['ok']:
+                return {}
+            if result.get('captcha'):
+                return 'CAPTCHA'
+            if result['cause'] in ('BLOCKED', 'THROTTLED') or result.get('transient'):
+                return 'BLOCKED'
 
-        # 토큰 만료일 수 있으니 갱신 후 한 번 더
-        self.mobile.csrf = ''
-        try:
-            result = self.mobile.delete(self.user_id, log_no)
-        except Exception:
-            return None
+            # 토큰 만료일 수 있으니 갱신해 한 번 더
+            if attempt == 0:
+                self.mobile.csrf = ''
 
-        if result['ok']:
-            return {}
-        if result['cause'] == 'BLOCKED' or result.get('transient'):
-            return 'BLOCKED'
         return {'result': 'fail', 'msg': result['cause']}
 
     @_handleProxyError
@@ -570,6 +582,16 @@ class Cleaner:
             time.sleep(self.delay)
             data = self.deletePost(entry, post_type, solve_captcha)
             delay = time.time() - a
+
+            if data == 'CAPTCHA':
+                # 갤로그 봇 확인. 기다려서는 풀리지 않으니 직접 풀게 한다
+                # 넘어가면 지워지지 않은 항목이 목록에서 빠지므로 같은 항목을 다시 시도한다
+                yield {
+                    'status': False,
+                    'data': 'captcha',
+                    'where': f'https://m.dcinside.com/gallog/{self.user_id}?menu=R_all',
+                }
+                continue
 
             if data == 'BLOCKED':
                 # 속도 제한. 기다렸다가 다시 시도한다
