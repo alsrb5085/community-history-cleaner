@@ -6,12 +6,40 @@ from typing import Union
 from urllib.parse import parse_qs, urlparse
 import requests
 import urllib3
+import os
+import re
 import time
+from datetime import datetime
 
 from dcinside_app_api import AppApi, AppApiError, AppAuthExpiredError
 from dcinside_mobile_gallog import MobileGallog
 
 MAX_DELAY = 0.9
+
+# 갤로그로 지울 때 쓰는 간격. log-del은 앱 API보다 훨씬 예민하다
+# 3초 간격으로 2~3건 만에 봇게이트가 걸렸고, 캡차를 푼 뒤 5초 간격으로는
+# 32건이 연속으로 지워졌다 (2026-08-10 실측)
+GALLOG_DELAY = 5.0
+
+# --- 대왕콘 ---
+# 디시가 이벤트 갤러리에 글 10개·댓글 20개를 채우면 대왕콘을 준다
+# 갤러리와 글번호는 이벤트가 바뀌면 같이 바뀐다. 안 되면 이것부터 확인할 것
+DAEWANGCON_GALLERY = 'kingcon'
+DAEWANGCON_POST_NO = '1400'
+DAEWANGCON_POSTS = 10
+DAEWANGCON_COMMENTS = 20
+# 디시가 글쓰기에 30초 제한을 걸어서 몰아 쓰면 거절당한다
+# 몇 개마다 길게 쉰다. 거절당하면 _writeWithRetry가 더 기다렸다 다시 하므로
+# 여기를 넉넉히 잡을 이유는 없다 (dccleaner는 글 쪽을 105초로 잡는다)
+DAEWANGCON_POST_INTERVAL = 5.0
+DAEWANGCON_POST_BATCH = 5
+DAEWANGCON_POST_BATCH_WAIT = 30.0
+DAEWANGCON_COMMENT_INTERVAL = 3.0
+DAEWANGCON_COMMENT_BATCH = 10
+DAEWANGCON_COMMENT_BATCH_WAIT = 90.0
+# 거절당했을 때 기다렸다 다시 해보는 횟수
+DAEWANGCON_RETRIES = 3
+SET_BIGCON_URL = 'https://gall.dcinside.com/dccon/set_bigcon'
 
 # 서버가 잠깐 거부했을 때 쓰는 문구들. 버리지 말고 뒤로 미뤄 다시 시도한다
 # '삭제할 수 없습니다'는 여기 없다. 원글이 삭제된 댓글이라 영구 실패이고,
@@ -19,6 +47,45 @@ MAX_DELAY = 0.9
 RETRYABLE_CAUSES = ('잠시후', '다시시도', '다시이용', '일시적')
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# 갤로그가 쓰는 날짜 표기들. 목록 응답에 섞여 나온다
+# 연도가 없는 표기는 올해로 본다
+_DATE_FORMATS = (
+    ('%Y.%m.%d %H:%M:%S', False),
+    ('%Y.%m.%d %H:%M', False),
+    ('%Y.%m.%d', False),
+    ('%Y-%m-%d %H:%M:%S', False),
+    ('%Y-%m-%d %H:%M', False),
+    ('%Y-%m-%d', False),
+    ('%m.%d %H:%M', True),
+    ('%m-%d %H:%M', True),
+    ('%m.%d', True),
+)
+
+
+# reply는 None('전체')도 의미가 있는 값이라 '안 건드림'과 구분해야 한다
+_UNSET = object()
+
+
+def parseGallogDate(text: str):
+    """목록의 작성일을 date로. 못 읽으면 None
+
+    None을 '오래된 글'로 취급하면 안 된다. 날짜를 확인하지 못한 항목을
+    지우는 쪽이 되돌릴 수 없는 실수다
+    """
+    text = str(text or '').strip()
+    if not text:
+        return None
+    for fmt, needs_year in _DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if needs_year:
+            parsed = parsed.replace(year=datetime.now().year)
+        return parsed.date()
+    return None
 
 
 def _isRetryableCause(cause: str) -> bool:
@@ -94,6 +161,107 @@ class Cleaner:
         # (JSON 11KB / 30건 vs HTML 43KB / 20건)
         self.mobile = MobileGallog()
         self.use_mobile = True
+        # 갤로그로만 지울 수 있는 것들. 삭제 도중에 갤로그를 두드리면 봇게이트가
+        # 걸려 앱 API로 지울 수 있는 나머지까지 멈춘다. 모아뒀다 마지막에 지운다
+        self.deferred_list = []
+        self.gallog_delay = GALLOG_DELAY
+        # 목록을 거르는 조건. 전부 목록 응답만으로 판정하므로 요청이 늘지 않는다
+        self.min_age_days = 0        # N일 이상 지난 것만
+        self.include_pattern = None  # 이 정규식에 걸리는 것만
+        self.exclude_pattern = None  # 이 정규식에 걸리면 남긴다
+        self.reply_filter = None     # True=대댓글만, False=일반 댓글만, None=전체
+        self.keep_secret = False     # 비밀글은 남긴다
+        self.skipped_by_filter = 0   # 조건에 걸려 목록에서 빠진 수
+        # 봇체크 캡차용. 처음 걸렸을 때만 만든다 (모델 로딩이 무겁다)
+        self._ocr = None
+        # 자동으로 푸는 동안 본 이미지를 남긴다. 캡차가 걸렸을 때만 쓰인다
+        # 못 푼 이미지가 남아야 다음에 원인을 좁힐 수 있다. ''이면 저장 안 함
+        self.captcha_dump_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'captcha_samples')
+
+    # --- 목록 거르기 ---
+
+    def setFilter(self, min_age_days: int = None, include: str = None,
+                  exclude: str = None, reply=_UNSET,
+                  keep_secret: bool = None) -> None:
+        """거르는 조건을 설정한다. 정규식이 잘못되면 re.error가 올라온다"""
+        if min_age_days is not None:
+            self.min_age_days = max(0, int(min_age_days))
+        if include is not None:
+            self.include_pattern = re.compile(include) if include else None
+        if exclude is not None:
+            self.exclude_pattern = re.compile(exclude) if exclude else None
+        if reply is not _UNSET:
+            self.reply_filter = reply
+        if keep_secret is not None:
+            self.keep_secret = bool(keep_secret)
+
+    def clearFilter(self) -> None:
+        self.min_age_days = 0
+        self.include_pattern = None
+        self.exclude_pattern = None
+        self.reply_filter = None
+        self.keep_secret = False
+
+    def describeFilter(self) -> list:
+        """설정된 조건을 사람이 읽을 말로. 없으면 빈 목록"""
+        lines = []
+        if self.min_age_days:
+            lines.append(f'{self.min_age_days}일 이상 지난 것만')
+        if self.include_pattern:
+            lines.append(f'내용이 /{self.include_pattern.pattern}/ 에 걸리는 것만')
+        if self.exclude_pattern:
+            lines.append(f'내용이 /{self.exclude_pattern.pattern}/ 에 걸리면 남김')
+        if self.reply_filter is True:
+            lines.append('대댓글만')
+        elif self.reply_filter is False:
+            lines.append('일반 댓글만 (대댓글 남김)')
+        if self.keep_secret:
+            lines.append('비밀글은 남김')
+        return lines
+
+    def hasFilter(self) -> bool:
+        return bool(self.describeFilter())
+
+    @staticmethod
+    def entryText(entry: dict, post_type: str) -> str:
+        """정규식을 걸 대상. 글은 제목, 댓글은 본문
+
+        댓글의 subject는 내 댓글이 아니라 원글 제목이라 여기 넣지 않는다
+        """
+        if post_type == 'comment':
+            return entry.get('memo', '')
+        return entry.get('subject', '')
+
+    def matchesFilter(self, entry: dict, post_type: str) -> bool:
+        """이 항목을 지울지. 조건이 없으면 전부 True"""
+        if not isinstance(entry, dict):
+            return True
+
+        if self.keep_secret and entry.get('secret'):
+            return False
+
+        if self.reply_filter is not None and post_type == 'comment':
+            if bool(entry.get('is_reply')) != self.reply_filter:
+                return False
+
+        if self.min_age_days:
+            written = parseGallogDate(entry.get('wdate'))
+            # 날짜를 못 읽었으면 남긴다. 확인 못 한 걸 지우는 쪽이 위험하다
+            if written is None:
+                return False
+            age = (datetime.now().date() - written).days
+            if age < self.min_age_days:
+                return False
+
+        if self.include_pattern or self.exclude_pattern:
+            text = self.entryText(entry, post_type)
+            if self.include_pattern and not self.include_pattern.search(text):
+                return False
+            if self.exclude_pattern and self.exclude_pattern.search(text):
+                return False
+
+        return True
 
     def updateDelay(self):
         self.delay = round(MAX_DELAY / (len(self.proxy_list) or 1), 1)
@@ -372,11 +540,15 @@ class Cleaner:
             'comment_num': remove_bracket(comment_num)
         }
 
-    def deletePost(self, post, post_type: str, solve_captcha: bool) -> Union[dict, bool]:
+    def deletePost(self, post, post_type: str, solve_captcha: bool,
+                   allow_gallog: bool = True) -> Union[dict, bool]:
         """글/댓글 하나를 삭제한다
 
         앱 API -> 모바일 갤로그 -> 데스크톱 갤로그 순으로 시도한다
         앱 API는 갤로그를 건드리지 않아 속도 제한에 걸리지 않는다
+
+        allow_gallog가 False면 갤로그로 넘어가야 하는 건을 'DEFER'로 돌려준다
+        호출부가 모아뒀다가 나중에 따로 지운다
         """
         entry = post if isinstance(post, dict) else {'log_no': post, 'gallery': '', 'no': ''}
 
@@ -387,7 +559,9 @@ class Cleaner:
                 entry['gall_code'], entry.get('gall_type') or 'G')
 
         # 1) 앱 API. 모바일 목록이 글번호·댓글번호를 다 주므로 댓글도 여기서 지운다
-        if not solve_captcha and self.isAppApiReady() and self._canUseAppApi(entry, post_type):
+        # 이미 앱 API가 거절해서 미뤄둔 건은 다시 물어볼 필요가 없다
+        if (not solve_captcha and not entry.get('_gallog_only')
+                and self.isAppApiReady() and self._canUseAppApi(entry, post_type)):
             result = self._deleteViaAppApi(entry, post_type)
 
             # 삭제 성공
@@ -405,6 +579,13 @@ class Cleaner:
             # 거부당한 경우도 마찬가지로 넘긴다. 원글이 삭제된 댓글이 대표적이다
             # 앱 API는 원글 번호로 대상을 찾지만 갤로그 log-del은 로그 항목을
             # 지우므로 원글이 없어도 된다
+            #
+            # 다만 지금 넘기지는 않는다. 삭제 한가운데서 log-del을 두드리면
+            # 2~3건 만에 봇게이트가 걸리고, 그러면 앱 API로 지울 수 있는
+            # 나머지까지 통째로 멈춘다. 미뤄뒀다 마지막에 몰아서 지운다
+            if not allow_gallog and entry.get('log_no'):
+                return 'DEFER'
+
             if self.use_mobile and entry.get('log_no'):
                 fallback = self._deleteViaMobileGallog(entry['log_no'])
                 if fallback is not None:
@@ -412,6 +593,12 @@ class Cleaner:
             if result is None:
                 return {'result': 'fail', 'msg': self.last_app_api_error or '앱 API를 쓸 수 없습니다.'}
             return result
+
+        # 앱 API로는 애초에 못 지우는 항목(갤러리 ID나 댓글번호가 없는 것)이다
+        # 이것도 갤로그 몫이라 같이 미뤄둔다. 앱 API가 아예 없으면 미룰 이유가
+        # 없다 -- 어차피 전부 갤로그로 가므로 순서만 바뀐다
+        if not allow_gallog and self.isAppApiReady() and entry.get('log_no'):
+            return 'DEFER'
 
         # 2) 모바일 갤로그. log_no 하나로 글·댓글을 모두 처리한다
         if self.use_mobile and not solve_captcha and entry.get('log_no'):
@@ -571,29 +758,275 @@ class Cleaner:
             return {}
         return data
 
-    def deletePosts(self, post_type: str) -> Union[str, list]:
-        solve_captcha = False
+    def _dumpCaptcha(self, attempt: int, image: bytes, text: str) -> None:
+        """자동 해제 중에 본 이미지를 남긴다. 실패해도 그냥 넘어간다"""
+        if not self.captcha_dump_dir:
+            return
+        try:
+            os.makedirs(self.captcha_dump_dir, exist_ok=True)
+            safe = ''.join(c for c in text if c.isalnum()) or 'unreadable'
+            name = f'{int(time.time())}_{attempt:02d}_{safe[:16]}.png'
+            with open(os.path.join(self.captcha_dump_dir, name), 'wb') as f:
+                f.write(image)
+        except OSError:
+            pass
 
-        while self.post_list:
+    def solveCaptchaAuto(self, tries: int = 40, notify=None) -> dict:
+        """모바일 갤로그 봇체크를 ddddocr로 풀어 본다
+
+        이 캡차는 한글이 섞여 나오는데 ddddocr charset엔 한글이 없다시피 해서
+        한글 이미지는 한자로 뭉개진다. 그래서 읽으려 들지 않고 고른다 --
+        영문·숫자만 나올 때까지 새로 뽑고 그때만 제출한다
+
+        실패해도 예외를 올리지 않는다. 사람이 직접 푸는 길은 그대로 남는다
+        """
+        if not self.use_mobile:
+            return {'solved': False, 'reason': 'no_captcha'}
+        if self._ocr is None:
+            try:
+                import ddddocr
+            except ImportError:
+                return {'solved': False, 'reason': 'ddddocr이 설치되지 않았습니다.'}
+            try:
+                self._ocr = ddddocr.DdddOcr(show_ad=False)
+            except Exception as e:
+                return {'solved': False, 'reason': f'ddddocr 초기화 실패: {e}'}
+        try:
+            return self.mobile.solveCaptcha(
+                self.user_id, self._ocr, tries=tries,
+                notify=notify, dump=self._dumpCaptcha)
+        except Exception as e:
+            return {'solved': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    def _resolveCaptcha(self):
+        """봇체크를 자동으로 풀어 보고, 안 되면 사람에게 넘긴다"""
+        yield {'status': False, 'data': 'captcha_solving'}
+        result = self.solveCaptchaAuto()
+        if result.get('solved'):
+            yield {
+                'status': False,
+                'data': 'captcha_solved',
+                'attempts': result.get('attempts', 0),
+                'code': result.get('code', ''),
+            }
+            return
+        yield {
+            'status': False,
+            'data': 'captcha',
+            'where': f'https://m.dcinside.com/gallog/{self.user_id}?menu=R_all',
+            'reason': result.get('reason', ''),
+            'attempts': result.get('attempts', 0),
+        }
+
+    def remainingCount(self) -> int:
+        """아직 안 지운 건수. 미뤄둔 것까지 센다
+
+        중단됐을 때 남은 건수를 post_list만으로 세면 미뤄둔 만큼 적게 나온다
+        """
+        return len(self.post_list) + len(self.deferred_list)
+
+    # --- 대왕콘 ---
+
+    def setBigcon(self) -> dict:
+        """대왕콘 수령. 앱 API엔 이 경로가 없어 웹으로 보낸다
+
+        글·댓글을 다 채운 뒤 한 번만 부르므로 갤로그 부하와는 무관하다
+        """
+        cookies = self.session.cookies.get_dict()
+        ci_c = cookies.get('ci_c')
+        if not ci_c:
+            return {'ok': False, 'cause': 'ci_c 쿠키가 없습니다. 다시 로그인해 주세요.'}
+        try:
+            res = self.session.post(
+                SET_BIGCON_URL,
+                data={'ci_t': ci_c},
+                headers={
+                    'Accept': '*/*',
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'Origin': 'https://gall.dcinside.com',
+                    'Referer': f'https://gall.dcinside.com/board/view/?id={DAEWANGCON_GALLERY}&no={DAEWANGCON_POST_NO}',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'User-Agent': self.user_agent,
+                },
+                timeout=20)
+        except requests.RequestException as e:
+            return {'ok': False, 'cause': f'{type(e).__name__}: {e}'}
+        if res.status_code != 200:
+            return {'ok': False, 'cause': f'HTTP {res.status_code}'}
+        return {'ok': True, 'cause': res.text.strip()[:160]}
+
+    def _writeWithRetry(self, write_fn):
+        """거절당하면 기다렸다 다시 해본다
+
+        글쓰기 제한은 잠깐 뒤에 풀리므로 한 번 실패했다고 버리면 손해다
+        캡차가 걸린 것이면 기다려도 안 풀리니 바로 돌려준다
+        """
+        result = None
+        for attempt in range(1, DAEWANGCON_RETRIES + 1):
+            try:
+                result = write_fn()
+            except (AppApiError, requests.RequestException) as e:
+                result = {'ok': False, 'cause': f'{type(e).__name__}: {e}',
+                          'captcha': False, 'transient': True}
+            if result['ok'] or result.get('captcha'):
+                return result
+            if not result.get('transient') and result['cause'] != 'BLOCKED':
+                return result
+            if attempt < DAEWANGCON_RETRIES:
+                time.sleep(30.0 * attempt)
+        return result
+
+    def earnDaewangcon(self, subject: str = '', content: str = '', comment: str = '',
+                       gallery: str = DAEWANGCON_GALLERY,
+                       post_no: str = DAEWANGCON_POST_NO):
+        """글 10개·댓글 20개를 쓰고 대왕콘을 받는다
+
+        전부 앱 API로 보낸다. 마지막 수령만 웹이다
+        작성한 글·댓글은 지우지 않는다 -- 지우면 조건이 풀릴 수 있고,
+        지우고 싶으면 평소처럼 목록을 받아 지우면 된다
+        """
+        if not self.isAppApiReady():
+            yield {'status': False, 'data': 'error',
+                   'reason': '앱 API가 준비되지 않았습니다. 먼저 로그인해 주세요.'}
+            return
+
+        stamp = str(int(time.time()))[-5:]
+        subject = subject or f'정리 {stamp}'
+        content = content or subject
+        comment = comment or subject
+
+        written = {'posting': 0, 'comment': 0}
+        total = DAEWANGCON_POSTS + DAEWANGCON_COMMENTS
+        yield {'status': False, 'data': 'start', 'total': total,
+               'gallery': gallery, 'post_no': post_no}
+
+        plan = (
+            ('posting', DAEWANGCON_POSTS, DAEWANGCON_POST_INTERVAL,
+             DAEWANGCON_POST_BATCH, DAEWANGCON_POST_BATCH_WAIT),
+            ('comment', DAEWANGCON_COMMENTS, DAEWANGCON_COMMENT_INTERVAL,
+             DAEWANGCON_COMMENT_BATCH, DAEWANGCON_COMMENT_BATCH_WAIT),
+        )
+
+        for kind, count, interval, batch, batch_wait in plan:
+            for i in range(1, count + 1):
+                # 몇 개마다 길게 쉰다. 안 그러면 글쓰기 제한에 걸린다
+                if i > 1 and (i - 1) % batch == 0:
+                    yield {'status': False, 'data': 'cooldown', 'wait': batch_wait,
+                           'kind': kind}
+                    time.sleep(batch_wait)
+
+                text = f'{subject} ({i})' if kind == 'posting' else f'{comment} ({i})'
+                if kind == 'posting':
+                    result = self._writeWithRetry(
+                        lambda: self.app_api.writeArticle(gallery, text, f'{content} ({i})'))
+                else:
+                    result = self._writeWithRetry(
+                        lambda: self.app_api.writeComment(gallery, post_no, text))
+
+                if result['ok']:
+                    written[kind] += 1
+                    yield {'status': True, 'data': 'written', 'kind': kind,
+                           'index': i, 'count': count, 'no': result.get('no', '')}
+                else:
+                    yield {'status': False, 'data': 'write_failed', 'kind': kind,
+                           'index': i, 'count': count, 'reason': result['cause'],
+                           'captcha': result.get('captcha', False)}
+                    if result.get('captcha'):
+                        yield {'status': False, 'data': 'error',
+                               'reason': '앱 쪽 보안코드가 걸렸습니다. 잠시 후 다시 시도해 주세요.'}
+                        return
+
+                if i < count:
+                    time.sleep(interval)
+
+        if written['posting'] < DAEWANGCON_POSTS or written['comment'] < DAEWANGCON_COMMENTS:
+            yield {'status': False, 'data': 'incomplete',
+                   'posts': written['posting'], 'comments': written['comment'],
+                   'need_posts': DAEWANGCON_POSTS, 'need_comments': DAEWANGCON_COMMENTS}
+            return
+
+        yield {'status': False, 'data': 'claiming'}
+        result = self.setBigcon()
+        if result['ok']:
+            yield {'status': True, 'data': 'claimed', 'response': result['cause']}
+        else:
+            yield {'status': False, 'data': 'claim_failed', 'reason': result['cause']}
+
+    def deletePosts(self, post_type: str) -> Union[str, list]:
+        """글/댓글을 순서대로 지운다
+
+        중단되더라도 미뤄둔 항목은 목록으로 되돌린다
+        안 그러면 다음 실행이 그 항목들을 아예 모르게 된다
+        """
+        try:
+            yield from self._deletePostsInner(post_type)
+        finally:
+            if self.deferred_list:
+                self.post_list.extend(self.deferred_list)
+                self.deferred_list = []
+
+    def _deletePostsInner(self, post_type: str):
+        solve_captcha = False
+        self.deferred_list = []
+        # 갤로그 몫을 몰아 지우는 단계인지. 이때만 갤로그를 두드린다
+        draining = False
+
+        while True:
+            if not self.post_list:
+                if draining or not self.deferred_list:
+                    return
+                # 앱 API로 지울 수 있는 건 다 지웠다. 이제 갤로그 차례다
+                # 여기부터는 간격을 늘린다. log-del이 훨씬 예민하다
+                draining = True
+                self.post_list = self.deferred_list
+                self.deferred_list = []
+                yield {
+                    'status': False,
+                    'data': 'drain_start',
+                    'count': len(self.post_list),
+                    'delay': self.gallog_delay,
+                }
+
             entry = self.post_list[0]
             post_no = entry.get('log_no') or entry.get('no') if isinstance(entry, dict) else entry
 
             a = time.time()
-            time.sleep(self.delay)
-            data = self.deletePost(entry, post_type, solve_captcha)
+            time.sleep(self.gallog_delay if draining else self.delay)
+            data = self.deletePost(entry, post_type, solve_captcha,
+                                   allow_gallog=draining)
             delay = time.time() - a
 
-            if data == 'CAPTCHA':
-                # 갤로그 봇 확인. 기다려서는 풀리지 않으니 직접 풀게 한다
-                # 넘어가면 지워지지 않은 항목이 목록에서 빠지므로 같은 항목을 다시 시도한다
+            if data == 'DEFER':
+                # 갤로그로만 되는 건이다. 지금 넘기면 봇게이트가 걸려
+                # 앱 API로 지울 수 있는 나머지까지 멈춘다
+                self.post_list.pop(0)
+                # 2단계에서 앱 API를 다시 물어볼 필요가 없다는 표시
+                if isinstance(entry, dict):
+                    entry['_gallog_only'] = True
+                self.deferred_list.append(entry)
                 yield {
                     'status': False,
-                    'data': 'captcha',
-                    'where': f'https://m.dcinside.com/gallog/{self.user_id}?menu=R_all',
+                    'data': 'deferred',
+                    'del_no': post_no,
+                    'count': len(self.deferred_list),
                 }
                 continue
 
+            if data == 'CAPTCHA':
+                # 갤로그 봇 확인. 기다려서는 풀리지 않으니 풀고 나서 다시 한다
+                # 넘어가면 지워지지 않은 항목이 목록에서 빠지므로 같은 항목을 다시 시도한다
+                yield from self._resolveCaptcha()
+                continue
+
             if data == 'BLOCKED':
+                # 봇체크도 여기로 들어온다. 앱 API는 게이트에 걸리면 빈 본문이나
+                # "잠시 후 다시 이용"을 돌려주는데 둘 다 BLOCKED로 뭉뚱그려져
+                # 속도 제한으로 보고됐다. 기다려도 풀리지 않으니 7분 반을 버린 뒤
+                # IP 차단으로 잘못 끝난다. 기다리기 전에 게이트부터 확인한다
+                if self.use_mobile and self.mobile.hasCaptcha(self.user_id):
+                    yield from self._resolveCaptcha()
+                    continue
+
                 # 속도 제한. 기다렸다가 다시 시도한다
                 # 목록 조회의 waitAndRetry와 같은 타이밍 (30초 -> 60초 -> 최대 120초)
                 recovered = False
@@ -607,7 +1040,8 @@ class Cleaner:
                         'max_attempts': 5,
                     }
                     time.sleep(wait)
-                    data = self.deletePost(entry, post_type, solve_captcha)
+                    data = self.deletePost(entry, post_type, solve_captcha,
+                                           allow_gallog=draining)
                     if data != 'BLOCKED':
                         recovered = True
                         yield {
@@ -617,13 +1051,24 @@ class Cleaner:
                         break
 
                 if not recovered:
+                    # 기다리는 사이에 게이트가 붙었을 수도 있다
+                    # 확인하지 않으면 풀 수 있는 상태를 IP 차단으로 끝낸다
+                    if self.use_mobile and self.mobile.hasCaptcha(self.user_id):
+                        yield from self._resolveCaptcha()
+                        continue
                     yield {
                         'status': False,
                         'data': 'ipblocked',
                         'reason': self.last_app_api_error or ''
                     }
                     return
+
                 # 재시도 성공. data를 가지고 아래 처리로 넘어간다
+                # 다만 'CAPTCHA'나 'DEFER' 같은 다른 신호로 돌아왔을 수 있다
+                # 아래는 data를 dict로 다루므로 문자열이 들어가면 죽는다
+                # 항목은 아직 목록에 그대로 있으니 위에서 다시 판정하게 한다
+                if isinstance(data, str):
+                    continue
 
             if data and ('captcha' in data['result'] or ('fail' in data['result'] and 'g-recaptcha error!' in data['msg'])):
                 if self.twocaptcha_key: 
@@ -754,6 +1199,7 @@ class Cleaner:
         return entry
 
     def aggregatePosts(self, gno: str, post_type: str) -> None:
+        self.skipped_by_filter = 0
         # 모바일 API로 수집하고, 실패하면 데스크톱으로 돌아간다
         if self.use_mobile:
             result = self._aggregateViaMobile(gno, post_type)
@@ -781,7 +1227,7 @@ class Cleaner:
             return 'FALLBACK'
 
         last_page = page_data['last_page']
-        self._appendFiltered(page_data['entries'], gno)
+        self._appendFiltered(page_data['entries'], gno, post_type)
         events.append({'status': True, 'data': {'index': 1, 'proxy': '', 'delay': round(delay, 1)}})
 
         # 나머지 페이지
@@ -795,22 +1241,34 @@ class Cleaner:
                 events.append({'status': False, 'data': 'ipblocked'})
                 return events
 
-            self._appendFiltered(page_data['entries'], gno)
+            self._appendFiltered(page_data['entries'], gno, post_type)
             events.append({'status': True, 'data': {'index': page, 'proxy': '', 'delay': round(delay, 1)}})
 
         return events
 
-    def _appendFiltered(self, entries: list, gno: str) -> None:
+    def _appendFiltered(self, entries: list, gno: str, post_type: str = '') -> None:
         """갤러리 필터를 적용해 post_list에 넣는다
 
         gno가 비어 있으면 전체, 아니면 gall_code가 같은 것만
         """
         for entry in reversed(entries):
-            if not gno or entry.get('gall_code') == gno:
-                self.post_list.append(entry)
+            if gno and entry.get('gall_code') != gno:
+                continue
+            # 목록 응답만으로 판정한다. 여기서 걸러도 요청은 늘지 않는다
+            if not self.matchesFilter(entry, post_type):
+                self.skipped_by_filter += 1
+                continue
+            self.post_list.append(entry)
 
     def _aggregateViaDesktop(self, gno: str, post_type: str):
-        """데스크톱 갤로그로 목록 수집 (기존 로직)"""
+        """데스크톱 갤로그로 목록 수집 (기존 로직)
+
+        여기서는 글 번호만 나오고 작성일·본문이 없어 조건을 걸 수 없다
+        조건이 걸린 채로 조용히 전부 지우면 안 되므로 호출부에 알린다
+        """
+        if self.hasFilter():
+            yield {'status': False, 'data': 'filter_unavailable'}
+
         pages = self.getPageCount(gno, post_type)
         self.post_list = []
 

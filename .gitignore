@@ -32,6 +32,7 @@ dcinside-app-device.json
 wget-log*
 badblocks.txt
 /tmp/captcha_*.jpg
+captcha_samples/
 *.html
 
 # 일회용 진단 스크립트

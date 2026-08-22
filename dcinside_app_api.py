@@ -18,6 +18,7 @@ protobuf는 checkin 응답에서 varint 필드 두 개만 읽으면 되므로
 라이브러리 없이 아래 최소 구현으로 처리함
 """
 from typing import Optional, Tuple
+from urllib.parse import quote
 import hashlib
 import json
 import os
@@ -57,6 +58,9 @@ APP_VERIFICATION_URL = 'https://msign.dcinside.com/auth/mobile_app_verification'
 LOGIN_URL = 'https://msign.dcinside.com/api/login'
 ARTICLE_DELETE_URL = 'https://app.dcinside.com/api/gall_del.php'
 COMMENT_DELETE_URL = 'https://app.dcinside.com/api/comment_del.php'
+# 쓰기. 글만 호스트가 다르다 (tui-inside src/api/endpoints.ts 참조)
+ARTICLE_WRITE_URL = 'https://upload.dcinside.com/_app_write_api.php'
+COMMENT_WRITE_URL = 'https://app.dcinside.com/api/comment_ok.php'
 
 TIMEOUT = 20
 
@@ -74,6 +78,15 @@ TRANSIENT_RETRIES = 3
 TRANSIENT_RETRY_DELAY = 1.0
 
 
+def encodeDcField(value: str) -> str:
+    """앱이 글 제목·본문을 싣는 형태
+
+    JS encodeURIComponent와 같게 만들고 공백만 +로 바꾼다
+    파이썬 quote는 영숫자와 `_.-~`를 이미 안 건드리므로 나머지만 지정한다
+    """
+    return quote(str(value), safe="!*'()").replace('%20', '+')
+
+
 def isTruthyDcResult(value) -> bool:
     """앱 API의 성공 표기를 판정
 
@@ -89,6 +102,16 @@ def isTransientCause(cause: str) -> bool:
     같은 뜻인데 응답마다 띄어쓰기가 달라서 공백을 걷어내고 비교한다
     """
     return '잠시후다시이용해주세요' in cause.replace(' ', '')
+
+
+def isWriteCaptchaCause(cause: str) -> bool:
+    """쓰기에 보안코드를 요구하는 응답인지
+
+    이건 갤로그 봇체크와 다른, 앱 쪽 캡차다 (code.php / code_reple.php)
+    자동으로 풀지 않으므로 사용자에게 그대로 알린다
+    """
+    squeezed = cause.replace(' ', '')
+    return any(word in squeezed for word in ('보안코드', '자동입력방지', '코드를입력'))
 
 
 class AppApiError(Exception):
@@ -603,6 +626,94 @@ class AppApi:
         return {
             'ok': False,
             'cause': cause or f'삭제에 실패했습니다. (응답: {str(raw)[:160]})',
+            'transient': isTransientCause(cause),
+        }
+
+    # --- 쓰기 ---
+
+    def writeArticle(self, gallery_id: str, subject: str, content: str) -> dict:
+        """글 작성. {'ok', 'cause', 'no', 'captcha'} 형태로 돌려준다
+
+        본문은 memo_block[0] 하나만 쓴다. 이미지·디시콘 블록은 다루지 않는다
+        """
+        res = self.session.post(
+            ARTICLE_WRITE_URL,
+            files={
+                'id': (None, gallery_id),
+                'app_id': (None, self.app_id),
+                'mode': (None, 'write'),
+                'client_token': (None, self.client_token),
+                'subject': (None, encodeDcField(subject)),
+                'fix': (None, ''),
+                'secret_use': (None, '0'),
+                'user_id': (None, self.account['user_id']),
+                'memo_block[0]': (None, encodeDcField(content)),
+            },
+            headers={
+                'User-Agent': APP_USER_AGENT,
+                'Referer': 'https://www.dcinside.com',
+            },
+            timeout=TIMEOUT)
+        return self._parseWriteResult(res)
+
+    def writeComment(self, gallery_id: str, post_no: str, content: str) -> dict:
+        """댓글 작성. 본문은 인코딩하지 않고 그대로 싣는다"""
+        res = self.session.post(
+            COMMENT_WRITE_URL,
+            data={
+                'comment_memo': content,
+                'mode': 'com_write',
+                'reple_id': '',
+                'app_id': self.app_id,
+                'client_token': self.client_token,
+                'id': gallery_id,
+                'no': str(post_no),
+                'best_chk': 'N',
+                'best_comno': '0',
+                'board_id': self.account['login_id'],
+                'user_id': self.account['user_id'],
+            },
+            headers={'User-Agent': APP_USER_AGENT},
+            timeout=TIMEOUT)
+        return self._parseWriteResult(res)
+
+    def _parseWriteResult(self, res) -> dict:
+        """쓰기 응답을 정규화
+
+        성공하면 cause 자리에 글번호/댓글번호가 실려 온다
+        쓰기에는 별도 캡차가 걸릴 수 있어 따로 표시한다 (app.dcinside.com/code.php)
+        """
+        text = res.text.strip()
+        if not text:
+            return {'ok': False, 'cause': 'BLOCKED', 'no': '', 'captcha': False,
+                    'transient': True}
+        try:
+            raw = res.json()
+        except ValueError:
+            return {'ok': False, 'cause': f'JSON이 아닌 응답: {text[:160]}', 'no': '',
+                    'captcha': False, 'transient': False}
+
+        value = raw[0] if isinstance(raw, list) and raw else raw
+        if not isinstance(value, dict):
+            return {'ok': False, 'cause': f'알 수 없는 응답: {str(raw)[:160]}', 'no': '',
+                    'captcha': False, 'transient': False}
+
+        cause = str(value.get('cause', '') or value.get('message', '') or '')
+        if isTruthyDcResult(value.get('result')):
+            # 응답마다 번호를 싣는 자리가 다르다
+            no = str(value.get('comment_no') or value.get('no')
+                     or value.get('data') or cause or '')
+            return {'ok': True, 'cause': '', 'no': no, 'captcha': False,
+                    'transient': False}
+
+        kind = authExpiredKind(cause)
+        if kind:
+            raise AppAuthExpiredError(kind, cause)
+        return {
+            'ok': False,
+            'cause': cause or f'작성에 실패했습니다. (응답: {str(raw)[:160]})',
+            'no': '',
+            'captcha': isWriteCaptchaCause(cause),
             'transient': isTransientCause(cause),
         }
 

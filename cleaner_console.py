@@ -1,4 +1,5 @@
 from dcinside_cleaner import Cleaner
+import dcinside_cleaner as dc
 from getpass import getpass
 from tqdm import tqdm
 import traceback
@@ -125,6 +126,19 @@ class Console:
         print(f'로그인에 실패했습니다. ({reason})' if reason else '로그인에 실패했습니다. 비밀번호를 확인해 주세요.')
         return False
 
+    @staticmethod
+    def _captcha_reason(event: dict) -> str:
+        """자동 해제가 왜 실패했는지 사람이 읽을 말로"""
+        reason = event.get('reason') or ''
+        attempts = event.get('attempts') or 0
+        if reason == 'exhausted':
+            return f'{attempts}장을 뽑는 동안 영문·숫자만 있는 캡차가 안 나왔습니다'
+        if reason == 'static_image':
+            return '새로고침해도 같은 이미지가 옵니다. 코드가 다시 발급되지 않습니다'
+        if reason == 'no_captcha':
+            return '봇체크 화면을 읽지 못했습니다'
+        return reason or '알 수 없는 사유'
+
     def waitAndRetry(self, fetch, tries=5):
         """속도 제한에 걸리면 기다렸다가 다시 시도한다
 
@@ -175,6 +189,8 @@ class Console:
             print('proxy load [파일명] - 프록시 리스트를 불러옵니다.')
             print('proxy off - 프록시 사용을 중지합니다.')
             print('2captcha [api_key] - 2captcha API 키를 설정합니다.')
+            print('filter - 삭제 조건을 확인/설정합니다. (filter help로 자세히)')
+            print('wang - 글 10개·댓글 20개를 써서 대왕콘을 받습니다.')
             print('logout - 로그아웃합니다.')
             print('help - 도움말을 봅니다.')
             print('exit - 종료합니다.')
@@ -429,12 +445,174 @@ class Console:
                     print(f'{del_no}번 갤러리 {type_kor} 삭제를 시도합니다...')
                     self.delete(self.g_list[int(del_no)], self.g_list['type'])
 
+        elif cmd[0] == 'wang':
+            self.handleDaewangcon(cmd)
+
+        elif cmd[0] == 'filter':
+            self.handleFilter(cmd, cmd_input)
+
         elif cmd[0] == 'logout':
             self.login_flag = False
             self.user_id = ''
             self.user_pw = ''
             print('로그아웃되었습니다.')
             self.show_account_list()
+
+    @staticmethod
+    def askYes(question: str) -> bool:
+        """예/아니오. 그냥 엔터를 치면 예로 본다"""
+        answer = input(f'{question} (Y/n) >> ').strip().lower()
+        return answer in ('', 'y', 'yes')
+
+    def handleDaewangcon(self, cmd):
+        """대왕콘 받기
+
+        이벤트 갤러리에 글 10개·댓글 20개를 쓴다. 실제로 글이 올라가므로
+        시작 전에 한 번 확인을 받는다
+        """
+        if not self.login_flag:
+            print('먼저 로그인해 주세요.')
+            return
+
+        if not self.cleaner.isAppApiReady():
+            if not (self.user_id and self.user_pw):
+                print('앱 API에 비밀번호가 필요합니다. ID/PW로 로그인해 주세요.')
+                return
+            print('앱 API 준비 중...')
+            if not self.cleaner.enableAppApi(self.user_id, self.user_pw):
+                print(f'앱 API를 쓸 수 없습니다. ({self.cleaner.getLastAppApiError()})')
+                return
+
+        print(f'{dc.DAEWANGCON_GALLERY} 갤러리에 글 {dc.DAEWANGCON_POSTS}개와 '
+              f'{dc.DAEWANGCON_POST_NO}번 글에 댓글 {dc.DAEWANGCON_COMMENTS}개를 작성합니다.')
+        print('* 실제로 글이 올라갑니다. 작성한 글은 자동으로 지우지 않습니다.')
+        print('* 글쓰기 제한 때문에 5분 안팎 걸립니다.')
+        if not self.askYes('진행할까요?'):
+            print('취소했습니다.')
+            return
+
+        subject = input('글 제목/내용 (엔터: 기본값) >> ').strip()
+        comment = input('댓글 내용 (엔터: 제목과 동일) >> ').strip()
+
+        try:
+            with tqdm(total=dc.DAEWANGCON_POSTS + dc.DAEWANGCON_COMMENTS) as pbar:
+                for i in self.cleaner.earnDaewangcon(subject=subject, comment=comment):
+                    data = i['data']
+                    if data == 'written':
+                        kind = '글' if i['kind'] == 'posting' else '댓글'
+                        pbar.update(1)
+                        pbar.set_description(f"{kind} {i['index']}/{i['count']}")
+                    elif data == 'cooldown':
+                        kind = '글쓰기' if i['kind'] == 'posting' else '댓글'
+                        tqdm.write(f"{kind} 제한 때문에 {i['wait']:.0f}초 쉽니다... (취소: Ctrl+C)")
+                    elif data == 'write_failed':
+                        kind = '글' if i['kind'] == 'posting' else '댓글'
+                        tqdm.write(f"{kind} {i['index']}/{i['count']} 실패: {i['reason']}")
+                    elif data == 'claiming':
+                        tqdm.write('대왕콘 수령 요청 중...')
+                    elif data == 'claimed':
+                        tqdm.write('대왕콘을 받았습니다!')
+                    elif data == 'claim_failed':
+                        tqdm.write(f"수령에 실패했습니다: {i['reason']}")
+                        tqdm.write('* 글·댓글은 올라갔으니 디시에서 직접 받아보세요.')
+                    elif data == 'incomplete':
+                        tqdm.write(f"작성이 덜 됐습니다. (글 {i['posts']}/{i['need_posts']}, "
+                                   f"댓글 {i['comments']}/{i['need_comments']})")
+                        tqdm.write('* 조건을 못 채워 수령은 시도하지 않았습니다.')
+                    elif data == 'error':
+                        tqdm.write(f"중단: {i['reason']}")
+        except KeyboardInterrupt:
+            print('\n취소했습니다. 이미 올라간 글·댓글은 그대로 있습니다.')
+
+    def handleFilter(self, cmd, cmd_input):
+        """삭제 조건 설정
+
+        전부 목록 응답만으로 판정하므로 조건을 걸어도 요청이 늘지 않는다
+        """
+        if len(cmd) < 2 or cmd[1] == 'show':
+            lines = self.cleaner.describeFilter()
+            if lines:
+                print('[삭제 조건]')
+                for line in lines:
+                    print(f'  - {line}')
+            else:
+                print('설정된 조건이 없습니다. (전부 삭제)')
+            return
+
+        if cmd[1] == 'help':
+            print('filter                - 현재 조건을 봅니다.')
+            print('filter days [N]       - N일 이상 지난 것만 지웁니다. (0이면 해제)')
+            print('filter re [정규식]     - 내용이 걸리는 것만 지웁니다. (글=제목, 댓글=본문)')
+            print('filter xre [정규식]    - 내용이 걸리면 남깁니다.')
+            print('filter reply on       - 대댓글만 지웁니다.')
+            print('filter reply off      - 일반 댓글만 지웁니다. (대댓글 남김)')
+            print('filter reply all      - 대댓글 구분 없이 지웁니다.')
+            print('filter secret keep    - 비밀글은 남깁니다.')
+            print('filter secret del     - 비밀글도 지웁니다.')
+            print('filter clear          - 조건을 모두 해제합니다.')
+            print('* 조건은 목록을 받을 때 걸립니다. 바꾼 뒤 "p"나 "c"로 다시 받아 주세요.')
+            return
+
+        if cmd[1] == 'clear':
+            self.cleaner.clearFilter()
+            print('조건을 모두 해제했습니다.')
+            return
+
+        if cmd[1] == 'days':
+            if len(cmd) < 3 or not cmd[2].isdigit():
+                print('사용법: filter days [숫자]')
+                return
+            self.cleaner.setFilter(min_age_days=int(cmd[2]))
+            days = int(cmd[2])
+            print(f'{days}일 이상 지난 것만 지웁니다.' if days else '기간 조건을 해제했습니다.')
+            return
+
+        if cmd[1] in ('re', 'xre'):
+            # 정규식에 공백이 들어갈 수 있어 원문에서 잘라 쓴다
+            pattern = cmd_input.split(None, 2)[2] if len(cmd) > 2 else ''
+            try:
+                if cmd[1] == 're':
+                    self.cleaner.setFilter(include=pattern)
+                else:
+                    self.cleaner.setFilter(exclude=pattern)
+            except re.error as e:
+                print(f'정규식이 올바르지 않습니다: {e}')
+                return
+            if not pattern:
+                print('조건을 해제했습니다.')
+            else:
+                kept = '남깁니다' if cmd[1] == 'xre' else '지웁니다'
+                print(f'/{pattern}/ 에 걸리는 것을 {kept}.')
+            return
+
+        if cmd[1] == 'reply':
+            choice = cmd[2] if len(cmd) > 2 else ''
+            if choice == 'on':
+                self.cleaner.setFilter(reply=True)
+                print('대댓글만 지웁니다.')
+            elif choice == 'off':
+                self.cleaner.setFilter(reply=False)
+                print('일반 댓글만 지웁니다. (대댓글은 남깁니다)')
+            elif choice == 'all':
+                self.cleaner.setFilter(reply=None)
+                print('대댓글 구분 없이 지웁니다.')
+            else:
+                print('사용법: filter reply [on|off|all]')
+            return
+
+        if cmd[1] == 'secret':
+            choice = cmd[2] if len(cmd) > 2 else ''
+            if choice == 'keep':
+                self.cleaner.setFilter(keep_secret=True)
+                print('비밀글은 남깁니다.')
+            elif choice == 'del':
+                self.cleaner.setFilter(keep_secret=False)
+                print('비밀글도 지웁니다.')
+            else:
+                print('사용법: filter secret [keep|del]')
+            return
+
+        print('알 수 없는 조건입니다. "filter help"를 참고해 주세요.')
 
     def delete(self, gno, post_type):
         if not self.cleaner.verifyLogin():
@@ -475,6 +653,10 @@ class Console:
             pbar = None
             blocked_on_first = False
             for i in self.cleaner.aggregatePosts(gno, post_type):
+                if not i['status'] and i['data'] == 'filter_unavailable':
+                    print('* 갤로그 목록이 모바일 응답을 안 줘서 데스크톱으로 받습니다.')
+                    print('* 데스크톱 목록엔 작성일·본문이 없어 조건을 걸 수 없습니다. 조건을 무시하고 진행합니다.')
+                    continue
                 if not i['status'] and i['data'] == 'ipblocked':
                     if pbar is None:
                         # 첫 요청부터 차단. 다시 시도한다
@@ -497,8 +679,11 @@ class Console:
 
             if pbar is not None:
                 pbar.close()
+            skipped = self.cleaner.skipped_by_filter
+            if skipped:
+                print(f'조건에 걸려 {skipped}건은 남겨둡니다.')
             if not self.cleaner.post_list:
-                print('삭제할 항목이 없습니다.')
+                print('조건에 맞는 항목이 없습니다.' if skipped else '삭제할 항목이 없습니다.')
                 return
         except KeyboardInterrupt:
             print('\n작업이 취소되었습니다.')
@@ -509,6 +694,7 @@ class Console:
         deleted = 0
         failed = 0
         requeued = 0
+        deferred = 0
         try:
             with tqdm(total=total) as pbar:
                 generator = self.cleaner.deletePosts(post_type)
@@ -519,7 +705,7 @@ class Console:
                             if i['data'] == 'ipblocked':
                                 reason = i.get('reason') or '요청이 계속 거절되고 있습니다.'
                                 print(f'\n중단: {reason}')
-                                print(f'남은 {len(self.cleaner.post_list)}건은 그대로 있습니다. '
+                                print(f'남은 {self.cleaner.remainingCount()}건은 그대로 있습니다. '
                                       f'잠시 후 다시 시도해 주세요.')
                                 return
                             if i['data'] == 'rate_limited':
@@ -530,8 +716,28 @@ class Console:
                             if i['data'] == 'rate_cleared':
                                 tqdm.write('응답이 정상으로 돌아왔습니다.')
                                 continue
+                            if i['data'] == 'deferred':
+                                # 갤로그 몫으로 미뤄뒀다. 아직 안 끝났으므로
+                                # 진행률은 올리지 않는다
+                                deferred = i['count']
+                                continue
+                            if i['data'] == 'drain_start':
+                                tqdm.write(
+                                    f"앱 API로 지울 수 있는 건 다 지웠습니다. "
+                                    f"남은 {i['count']}건은 갤로그로 지웁니다 "
+                                    f"({i['delay']:.0f}초 간격, 봇체크가 뜰 수 있습니다)")
+                                deferred = 0
+                                continue
+                            if i['data'] == 'captcha_solving':
+                                tqdm.write('봇체크(캡차)가 감지되었습니다. 자동으로 풀어 봅니다...')
+                                continue
+                            if i['data'] == 'captcha_solved':
+                                tqdm.write(
+                                    f"봇체크를 통과했습니다. "
+                                    f"(코드 {i.get('code')}, 이미지 {i.get('attempts')}장째)")
+                                continue
                             if i['data'] == 'captcha':
-                                print('캡차가 감지되었습니다!')
+                                print(f'\n자동 해제에 실패했습니다. ({self._captcha_reason(i)})')
                                 if i.get('where'):
                                     print(f"  {i['where']} 에서 삭제를 눌러 코드를 입력해 주세요.")
                                 input('캡차 해제 후 엔터를 눌러주세요 >> ')
@@ -555,12 +761,13 @@ class Console:
                     except StopIteration:
                         break
                     except KeyboardInterrupt:
-                        print('\n[일시정지] 계속할까요? (y/n)')
-                        ans = input('>> ').strip().lower()
-                        if ans != 'y':
+                        if not self.askYes('\n[일시정지] 계속할까요?'):
                             print('삭제가 취소되었습니다.')
                             return
                         print('삭제를 재개합니다...')
+                        # 미뤄둔 항목을 목록에 되돌린 뒤 새로 시작해야 한다
+                        # 먼저 닫지 않으면 되돌리는 시점이 GC에 달리게 된다
+                        generator.close()
                         generator = self.cleaner.deletePosts(post_type)
         except KeyboardInterrupt:
             print('\n삭제가 취소되었습니다.')
